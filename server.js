@@ -5,6 +5,17 @@ const app = express();
 
 app.use(express.json());
 
+// Enable CORS for frontend
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, PUT, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.get('/', (req, res) => {
   return res.status(200).send({'message': 'SHIPTIVITY API. Read documentation to see API docs'});
 });
@@ -79,11 +90,10 @@ app.get('/api/v1/clients', (req, res) => {
         'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
       });
     }
-    const clients = db.prepare('select * from clients where status = ?').all(status);
+    const clients = db.prepare('select * from clients where status = ? order by priority asc').all(status);
     return res.status(200).send(clients);
   }
-  const statement = db.prepare('select * from clients');
-  const clients = statement.all();
+  const clients = db.prepare('select * from clients order by status, priority asc').all();
   return res.status(200).send(clients);
 });
 
@@ -99,6 +109,25 @@ app.get('/api/v1/clients/:id', (req, res) => {
   }
   return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
 });
+
+/**
+ * Validate status input
+ * @param {any} status
+ */
+const validateStatus = (status) => {
+  if (status !== 'backlog' && status !== 'in-progress' && status !== 'complete') {
+    return {
+      valid: false,
+      messageObj: {
+        'message': 'Invalid status provided.',
+        'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+      },
+    };
+  }
+  return {
+    valid: true,
+  };
+};
 
 /**
  * Update client information based on the parameters provided.
@@ -118,17 +147,89 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
   let { status, priority } = req.body;
-  let clients = db.prepare('select * from clients').all();
-  const client = clients.find(client => client.id === id);
+  const client = db.prepare('select * from clients where id = ?').get(id);
 
-  /* ---------- Update code below ----------*/
+  // Validate status if provided
+  if (status !== undefined) {
+    const { valid: statusValid, messageObj: statusMessageObj } = validateStatus(status);
+    if (!statusValid) {
+      return res.status(400).send(statusMessageObj);
+    }
+  }
+
+  // Validate priority if provided
+  if (priority !== undefined) {
+    priority = parseInt(priority, 10);
+    const { valid: priorityValid, messageObj: priorityMessageObj } = validatePriority(priority);
+    if (!priorityValid) {
+      return res.status(400).send(priorityMessageObj);
+    }
+    if (priority < 1) {
+      return res.status(400).send({
+        'message': 'Invalid priority provided.',
+        'long_message': 'Priority must be a positive integer starting from 1.',
+      });
+    }
+  }
+
+  const oldStatus = client.status;
+  const oldPriority = client.priority;
+  const newStatus = status !== undefined ? status : oldStatus;
+  const newPriority = priority !== undefined ? priority : oldPriority;
 
 
+  // Use a transaction for atomicity
+  const updateTransaction = db.transaction(() => {
+    if (oldStatus === newStatus) {
+      // Same lane - reordering within the lane
+      if (oldPriority !== newPriority) {
+        if (newPriority > oldPriority) {
+          // Moving down: shift cards between old and new position up
+          db.prepare(`
+            UPDATE clients
+            SET priority = priority - 1
+            WHERE status = ? AND priority > ? AND priority <= ?
+          `).run(oldStatus, oldPriority, newPriority);
+        } else {
+          // Moving up: shift cards between new and old position down
+          db.prepare(`
+            UPDATE clients
+            SET priority = priority + 1
+            WHERE status = ? AND priority >= ? AND priority < ?
+          `).run(oldStatus, newPriority, oldPriority);
+        }
+        // Update the moved client's priority
+        db.prepare('UPDATE clients SET priority = ? WHERE id = ?').run(newPriority, id);
+      }
+    } else {
+      // Moving to different lane
+      // 1. Remove from old lane - shift all cards after it up
+      db.prepare(`
+        UPDATE clients
+        SET priority = priority - 1
+        WHERE status = ? AND priority > ?
+      `).run(oldStatus, oldPriority);
 
+      // 2. Make room in new lane - shift cards at and after new position down
+      db.prepare(`
+        UPDATE clients
+        SET priority = priority + 1
+        WHERE status = ? AND priority >= ?
+      `).run(newStatus, newPriority);
+
+      // 3. Update the moved client's status and priority
+      db.prepare('UPDATE clients SET status = ?, priority = ? WHERE id = ?').run(newStatus, newPriority, id);
+    }
+  });
+
+  updateTransaction();
+
+  // Return all clients sorted by status and priority
+  const clients = db.prepare('select * from clients order by status, priority asc').all();
   return res.status(200).send(clients);
 });
 
